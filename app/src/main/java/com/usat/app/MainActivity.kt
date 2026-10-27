@@ -1,10 +1,10 @@
 package com.usat.app
 
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.annotation.RequiresApi
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
@@ -35,6 +35,20 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
+import com.usat.app.data.ActivityEntity
+import com.usat.app.data.AcademicProfileEntity
+import com.usat.app.data.StudentProfileEntity
+import com.usat.app.data.AssessmentEntity
+import com.usat.app.data.CourseEntity
+import com.usat.app.data.StudySessionEntity
+import com.usat.app.data.UsatCalculations
+import com.usat.app.data.UsatViewModel
+import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 
 private val Navy = Color(0xFF14213D)
 private val Amber = Color(0xFFFCA311)
@@ -51,10 +65,12 @@ class MainActivity : ComponentActivity() {
 }
 
 private data class StudyTask(
-    val id: Int,
+    val id: Long,
     val title: String,
+    val courseCode: String?,
     val course: String,
     val due: String,
+    val dueAtMillis: Long?,
     val priority: String,
     val type: String = "Academic task",
     val smartReminder: Boolean = false,
@@ -65,28 +81,47 @@ private data class Course(val code: String, val name: String, val studied: Float
 private data class AgendaActivity(val title: String, val detail: String, val time: String, val category: String, val hours: Float)
 private enum class Page(val label: String, val icon: ImageVector) {
     Overview("Overview", Icons.Default.Home), Schedule("Events", Icons.Default.DateRange),
-    Courses("Courses", Icons.Default.MenuBook), Analytics("Analytics", Icons.Default.BarChart), Advisor("AI Advisor", Icons.Default.AutoAwesome)
+    Courses("Courses", Icons.Default.MenuBook), Analytics("Analytics", Icons.Default.BarChart), Advisor("AI Advisor", Icons.Default.AutoAwesome),
+    Profiles("Academic profiles", Icons.Default.AccountCircle), Profile("Academic profile", Icons.Default.AccountCircle), ProfileForm("Profile form", Icons.Default.Edit)
 }
 
-@RequiresApi(Build.VERSION_CODES.HONEYCOMB_MR2)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun UsatApp() {
-    var tasks by remember { mutableStateOf(listOf(
-        StudyTask(1, "Database Systems assignment", "CSC 312", "Today, 11:59 PM", "High"),
-        StudyTask(2, "Review calculus problem set", "MTH 204", "Tomorrow, 9:00 AM", "Medium"),
-        StudyTask(3, "Prepare project presentation", "CSC 318", "Friday, 2:00 PM", "Medium")
-    )) }
-    var courses by remember { mutableStateOf(listOf(
-        Course("CSC 312", "Database Systems", 6.5f, 8f, "78%", "74%"),
-        Course("MTH 204", "Advanced Calculus", 4f, 6f, "72%", "70%"),
-        Course("CSC 318", "Software Engineering", 3.5f, 5f, "85%", "80%")
-    )) }
+    val viewModel: UsatViewModel = viewModel()
+    val data by viewModel.uiState.collectAsStateWithLifecycle()
+    var clockNow by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(data.openSession?.id, data.openSession?.state) {
+        while (data.openSession?.state == "active") {
+            clockNow = System.currentTimeMillis()
+            val active = data.openSession ?: break
+            if (UsatViewModel.elapsedSeconds(active, clockNow) >= active.plannedDurationSeconds) {
+                viewModel.completeFocusSession(active.id)
+                break
+            }
+            delay(1_000)
+        }
+    }
+    val currentWeekStart = LocalDate.now().with(java.time.DayOfWeek.MONDAY).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+    val allCourses = data.courses.map { entity ->
+        val studied = UsatCalculations.completedStudyHours(data.sessions.filter { it.courseCode == entity.code && (it.endedAtMillis ?: 0L) >= currentWeekStart })
+        val marks = data.assessments.filter { it.courseCode == entity.code }.sortedByDescending { it.recordedAtMillis }
+        val average = UsatCalculations.weightedAssessmentPercent(marks)
+        val previous = marks.drop(1).takeIf { it.isNotEmpty() }?.let { list -> list.sumOf { it.score.toDouble() } / list.sumOf { it.maxScore.toDouble() } * 100.0 }
+        Course(entity.code, entity.name, studied, entity.weeklyTargetHours, average?.let { "${it.toInt()}%" } ?: "N/A", previous?.let { "${it.toInt()}%" } ?: "N/A")
+    }
+    val tasks = data.activities.map { entity ->
+        StudyTask(entity.id, entity.title, entity.courseCode, entity.courseLabel, entity.dueLabel, entity.dueAtMillis, entity.priority, entity.category, entity.smartReminder, entity.plannedHours, entity.completed)
+    }
     var page by remember { mutableStateOf(Page.Overview) }
-    var academicPeriod by remember { mutableStateOf("Semester 2 · 2025/26") }
+    val academicPeriod = data.settings?.academicPeriod?.takeIf { it.isNotBlank() } ?: currentDefaultPeriod()
     var courseQuery by remember { mutableStateOf("") }
-    var selectedCourseCode by remember { mutableStateOf("CSC 312") }
+    var selectedCourseCode by remember { mutableStateOf("") }
     var showAddCourse by remember { mutableStateOf(false) }
+    var courseToEdit by remember { mutableStateOf<CourseEntity?>(null) }
+    var profileToEdit by remember { mutableStateOf<AcademicProfileEntity?>(null) }
+    var activityToEdit by remember { mutableStateOf<ActivityEntity?>(null) }
+    var assessmentToEdit by remember { mutableStateOf<AssessmentEntity?>(null) }
     var analyticsPeriod by remember { mutableStateOf("This week") }
     var analyticsCourse by remember { mutableStateOf("All courses") }
     var trendMode by remember { mutableStateOf("Both") }
@@ -95,17 +130,37 @@ private fun UsatApp() {
     var eventFilter by remember { mutableStateOf("All") }
     var showAdd by remember { mutableStateOf(false) }
     var showNotifications by remember { mutableStateOf(false) }
-    var timerRunning by remember { mutableStateOf(false) }
     var showOverviewWhy by rememberSaveable { mutableStateOf(false) }
     var showWelcome by rememberSaveable { mutableStateOf(true) }
-    var seconds by remember { mutableIntStateOf(25 * 60) }
-    LaunchedEffect(timerRunning) {
-        while (timerRunning && seconds > 0) { delay(1000); seconds-- }
-        if (seconds == 0) timerRunning = false
+    var showAddAssessment by remember { mutableStateOf(false) }
+    LaunchedEffect(data.settings?.eventCategoryFilter) { eventFilter = data.settings?.eventCategoryFilter ?: "All" }
+    val selectedEventDate = data.settings?.selectedEventDateEpochDay?.let(LocalDate::ofEpochDay) ?: LocalDate.now()
+    val activeProfile = data.profiles.firstOrNull { it.id == data.settings?.activeProfileId } ?: data.profiles.firstOrNull()
+    val activeProfileCourseCodes = data.profileCourses.filter { it.profileId == activeProfile?.id }.map { it.courseCode }.toSet()
+    val activeCourseCodes = data.courses.filter { it.academicPeriod == academicPeriod && (activeProfile == null || it.code in activeProfileCourseCodes) }.map { it.code }.toSet()
+    val courses = allCourses.filter { it.code in activeCourseCodes }
+    val weeklyStudyGoal = activeProfile?.weeklyStudyGoalHours ?: courses.sumOf { it.target.toDouble() }.toFloat()
+    val timerRunning = data.openSession?.state == "active"
+    val seconds = data.openSession?.let { (it.plannedDurationSeconds - UsatViewModel.elapsedSeconds(it, clockNow)).coerceAtLeast(0) } ?: 25 * 60
+    val snackbarHostState = remember { SnackbarHostState() }
+    LaunchedEffect(data.message, data.error) {
+        val notice = data.error ?: data.message
+        if (notice != null) { snackbarHostState.showSnackbar(notice); viewModel.clearMessage() }
+    }
+    LaunchedEffect(data.message) {
+        if (data.message == "Student and academic profile saved.") {
+            profileToEdit = null
+            page = Page.Profile
+        } else if (data.message == "Academic profile selected.") {
+            page = Page.Profile
+        }
     }
     MaterialTheme(colorScheme = lightColorScheme(primary = Navy, secondary = Amber, background = Canvas, surface = Color.White)) {
-        if (showWelcome) WelcomeScreen(onContinue = { showWelcome = false }) else {
-        Scaffold(containerColor = Canvas, topBar = {
+        if (showWelcome) WelcomeScreen(hasProfile = data.profiles.isNotEmpty(), onContinue = {
+            showWelcome = false
+            page = if (data.profiles.isEmpty()) Page.Profiles else Page.Profile
+        }) else {
+        Scaffold(containerColor = Canvas, snackbarHost = { SnackbarHost(snackbarHostState) }, topBar = {
             TopAppBar(
                 title = { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
                     Image(painterResource(R.drawable.usat_mark), "USAT app icon", Modifier.size(34.dp).clip(RoundedCornerShape(9.dp)), contentScale = ContentScale.Crop)
@@ -113,6 +168,7 @@ private fun UsatApp() {
                 } },
                 actions = {
                     IconButton(onClick = { showNotifications = true }) { Icon(Icons.Default.NotificationsNone, "Notifications", tint = Navy) }
+                    IconButton(onClick = { page = Page.Profiles }) { Icon(Icons.Default.AccountCircle, "Academic profiles", tint = Navy) }
                     if (androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp >= 380) {
                         FilledTonalButton(onClick = { showAdd = true }, contentPadding = PaddingValues(horizontal = 11.dp, vertical = 7.dp), colors = ButtonDefaults.filledTonalButtonColors(containerColor = Amber, contentColor = Navy)) {
                             Icon(Icons.Default.Add, null, modifier = Modifier.size(17.dp)); Spacer(Modifier.width(4.dp)); Text("Activity", fontSize = 12.sp, fontWeight = FontWeight.Bold)
@@ -125,44 +181,53 @@ private fun UsatApp() {
             )
         }, bottomBar = {
             NavigationBar(containerColor = Color.White) {
-                Page.entries.take(4).forEach { item ->
+                Page.entries.take(5).forEach { item ->
                     NavigationBarItem(selected = page == item, onClick = { page = item }, icon = { Icon(item.icon, item.label) }, label = { Text(item.label, fontSize = 10.sp) }, colors = NavigationBarItemDefaults.colors(selectedIconColor = Navy, indicatorColor = Amber.copy(alpha = .25f), selectedTextColor = Navy, unselectedTextColor = Muted))
                 }
             }
         }, floatingActionButton = {
-            if (page != Page.Overview && page != Page.Analytics) ExtendedFloatingActionButton(onClick = { if (page == Page.Advisor) page = Page.Overview else showAdd = true }, icon = { Icon(if (page == Page.Advisor) Icons.Default.Home else Icons.Default.Add, null) }, text = { Text(if (page == Page.Advisor) "Dashboard" else "Add activity") }, containerColor = Amber, contentColor = Navy)
+            if (page == Page.Schedule || page == Page.Courses || page == Page.Advisor) ExtendedFloatingActionButton(onClick = { if (page == Page.Advisor) page = Page.Overview else showAdd = true }, icon = { Icon(if (page == Page.Advisor) Icons.Default.Home else Icons.Default.Add, null) }, text = { Text(if (page == Page.Advisor) "Dashboard" else "Add activity") }, containerColor = Amber, contentColor = Navy)
         }) { padding ->
             LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 18.dp, bottom = 96.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                item { Heading(page) }
+                if (data.loading) item { Box(Modifier.fillMaxWidth().padding(40.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Amber) } }
+                item { Heading(page, data.studentProfile?.fullName) }
                 when (page) {
                     Page.Overview -> {
-                        item { OverviewDailyBriefCard(tasks, courses, showOverviewWhy, onWhyClick = { showOverviewWhy = !showOverviewWhy }) }
-                        item { FocusCard(timerRunning, seconds, onToggle = { timerRunning = !timerRunning }, onReset = { timerRunning = false; seconds = 25 * 60 }) }
-                        val firstOpenTask = tasks.firstOrNull { !it.done }
+                        item { OverviewDailyBriefCard(tasks, courses, weeklyStudyGoal, showOverviewWhy, onWhyClick = { showOverviewWhy = !showOverviewWhy }) }
+                        item { FocusCard(timerRunning, data.openSession?.state == "paused", seconds, onToggle = { viewModel.toggleFocusSession(selectedCourseCode.takeIf { code -> courses.any { it.code == code } }) }, onReset = { viewModel.resetFocusSession() }, courses = courses, selectedCourse = selectedCourseCode, onCourseSelect = { selectedCourseCode = it }) }
+                        val firstOpenTask = tasks.filter { !it.done }.minByOrNull { it.dueAtMillis ?: Long.MAX_VALUE }
                         val studiedHours = courses.sumOf { it.studied.toDouble() }.toFloat()
-                        val targetHours = courses.sumOf { it.target.toDouble() }.toFloat()
+                        val targetHours = weeklyStudyGoal
                         item {
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                 OverviewSummaryCard("Priority tasks", Icons.Default.CheckCircle, "${tasks.count { !it.done }}", "open tasks", firstOpenTask?.let { "Due soon · ${it.title}" } ?: "No tasks need attention", "Review tasks", Modifier.weight(1f), Amber) { page = Page.Schedule }
-                                OverviewSummaryCard("Today", Icons.Default.DateRange, "9:00", "AM · next event", "Advanced Databases · 90 min", "Open schedule", Modifier.weight(1f), Navy) { page = Page.Schedule }
+                                val dueToday = tasks.firstOrNull { it.dueAtMillis?.let { time -> Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()).toLocalDate() == LocalDate.now() } == true && !it.done }
+                                OverviewSummaryCard("Today", Icons.Default.DateRange, dueToday?.due?.substringAfter(", ") ?: if (dueToday == null) "Clear" else dueToday.due, if (dueToday == null) "no due task" else "due today", dueToday?.title ?: "No activities due today", "Open events", Modifier.weight(1f), Navy) { page = Page.Schedule }
                             }
                         }
                         item {
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                OverviewSummaryCard("Study progress", Icons.Default.BarChart, "${if (targetHours > 0f) (studiedHours / targetHours * 100).toInt() else 0}%", "of target", "${studiedHours.prettyHours()} of ${targetHours.prettyHours()} study hours", "View courses", Modifier.weight(1f), Amber, progress = if (targetHours > 0f) studiedHours / targetHours else 0f) { page = Page.Courses }
+                                val progress = UsatCalculations.targetProgressFraction(studiedHours, targetHours)
+                                OverviewSummaryCard("Study progress", Icons.Default.BarChart, "${(progress * 100).toInt()}%", "of target", "${studiedHours.prettyHours()} of ${targetHours.prettyHours()} study hours", "View courses", Modifier.weight(1f), Amber, progress = progress) { page = Page.Courses }
                                 OverviewSummaryCard("Upcoming", Icons.Default.Schedule, firstOpenTask?.due?.substringBefore(",") ?: "All clear", if (firstOpenTask == null) "deadlines" else "next deadline", firstOpenTask?.let { "${it.due} · ${it.title}" } ?: "No upcoming deadlines", "See deadlines", Modifier.weight(1f), Navy) { page = Page.Schedule }
                             }
                         }
                     }
                     Page.Schedule -> {
-                        item { EventsWeekHeader(onAdd = { showAdd = true }) }
-                        item { WeekStrip() }
-                        val academicHours = 6f + tasks.filter { !it.done && it.id > 3 && it.type in listOf("Academic task", "Class or assignment") }.sumOf { it.plannedHours.toDouble() }.toFloat()
-                        val studyHours = 6.5f + tasks.filter { !it.done && it.id > 3 && it.type == "Study session" }.sumOf { it.plannedHours.toDouble() }.toFloat()
-                        val extracurricularHours = 6f + tasks.filter { !it.done && it.id > 3 && it.type in listOf("Extracurricular task", "Personal activity") }.sumOf { it.plannedHours.toDouble() }.toFloat()
-                        val totalHours = academicHours + studyHours + extracurricularHours
-                        val targetHours = courses.sumOf { it.target.toDouble() }.toFloat()
-                        val studiedHours = courses.sumOf { it.studied.toDouble() }.toFloat()
+                        val today = selectedEventDate
+                        val weekStart = today.with(java.time.DayOfWeek.MONDAY)
+                        val weekEnd = weekStart.plusDays(7)
+                        val weekTasks = tasks.filter { it.dueAtMillis?.let { millis -> Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()).toLocalDate() in weekStart..<weekEnd } == true }
+                        val academicHours = weekTasks.filter { it.type in listOf("Academic task", "Class or assignment") }.sumOf { it.plannedHours.toDouble() }.toFloat()
+                        val studyHours = weekTasks.filter { it.type == "Study session" }.sumOf { it.plannedHours.toDouble() }.toFloat()
+                        val extracurricularHours = weekTasks.filter { it.type in listOf("Extracurricular task", "Personal activity") }.sumOf { it.plannedHours.toDouble() }.toFloat()
+                        val totalHours = weekTasks.sumOf { it.plannedHours.toDouble() }.toFloat()
+                        val targetHours = weeklyStudyGoal
+                        val weekStartMillis = weekStart.atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+                        val weekEndMillis = weekEnd.atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+                        val studiedHours = UsatCalculations.completedStudyHours(data.sessions.filter { session -> session.endedAtMillis?.let { it >= weekStartMillis && it < weekEndMillis } == true })
+                        item { EventsWeekHeader(onAdd = { showAdd = true }, date = today) }
+                        item { WeekStrip(date = today, onSelect = viewModel::updateSelectedEventDate) }
                         item {
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                 EventMetricCard(totalHours.durationLabel(), "Planned this week", Icons.Default.EventAvailable, Amber, Modifier.weight(1f))
@@ -170,52 +235,49 @@ private fun UsatApp() {
                             }
                         }
                         item { BalanceCard(academicHours, studyHours, extracurricularHours) }
-                        item { TodayPlanHeader() }
-                        item { EventCategoryFilters(eventFilter, onSelect = { eventFilter = it }) }
-                        val agenda = listOf(
-                            AgendaActivity("Advanced Databases", "CSC 312 · LT 04 · Class", "09:00 – 10:30", "Academic", 1.5f),
-                            AgendaActivity("Calculus study block", "MTH 204 · Library · Focus time", "12:00 – 13:00", "Study", 1f),
-                            AgendaActivity("Robotics club", "Engineering Lab · Club activity", "15:30 – 16:30", "Extracurricular", 1f)
-                        )
-                        val selectedAgenda = agenda.filter { eventFilter == "All" || it.category == eventFilter }
-                        val selectedTasks = tasks.filter { !it.done && (eventFilter == "All" || categoryFor(it.type) == eventFilter) }
-                        if (selectedAgenda.isEmpty() && selectedTasks.isEmpty()) item { EmptyState("No activities in this category", "Choose another category or add an activity.") }
-                        items(selectedAgenda) { activity -> AgendaCard(activity) }
-                        items(selectedTasks) { task -> TaskCard(task) { tasks = tasks.map { if (it.id == task.id) it.copy(done = !it.done) else it } } }
+                        item { TodayPlanHeader(today) }
+                        item { EventCategoryFilters(eventFilter, onSelect = { eventFilter = it; viewModel.updateEventFilter(it) }) }
+                        val selectedTasks = tasks.filter { it.dueAtMillis?.let { millis -> Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()).toLocalDate() == today } == true && (eventFilter == "All" || categoryFor(it.type) == eventFilter) }
+                        val todaysSessions = data.sessions.filter { session -> (session.state == "completed" || session.state == "active") && Instant.ofEpochMilli(session.startedAtMillis).atZone(ZoneId.systemDefault()).toLocalDate() == today }
+                        if (selectedTasks.isEmpty() && todaysSessions.isEmpty()) item { EmptyState("No activities planned for today", "Add an activity with a due date to see it in today’s plan.") }
+                        items(selectedTasks, key = { "activity-${it.id}" }) { task -> TaskCard(task, onToggle = { viewModel.setActivityCompleted(task.id, !task.done) }, onEdit = { activityToEdit = data.activities.firstOrNull { it.id == task.id }; showAdd = true }, onDelete = { viewModel.deleteActivity(task.id) }) }
+                        items(todaysSessions, key = { "session-${it.id}" }) { session -> StudySessionEventCard(session) }
                         item { EventsAdvisorCard(academicHours + studyHours, extracurricularHours, courses, tasks) }
                         val remindersOn = tasks.any { !it.done && it.smartReminder }
                         item { ReminderStatusCard(remindersOn, tasks.count { !it.done && it.smartReminder }) }
                     }
                     Page.Courses -> {
-                        item { PeriodPicker(academicPeriod, onSelect = { academicPeriod = it }) }
+                        item { PeriodPicker(academicPeriod, onSelect = { viewModel.updateAcademicPeriod(it) }) }
                         item { Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
                             OutlinedTextField(courseQuery, { courseQuery = it }, modifier = Modifier.weight(1f), singleLine = true, placeholder = { Text("Find a course", fontSize = 12.sp) }, leadingIcon = { Icon(Icons.Default.Search, null, tint = Muted) }, shape = RoundedCornerShape(13.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedContainerColor = Color.White, focusedContainerColor = Color.White))
                             IconButton(onClick = { showAddCourse = true }, modifier = Modifier.size(46.dp).background(Amber, RoundedCornerShape(13.dp))) { Icon(Icons.Default.Add, "Add course", tint = Navy) }
                         } }
-                        val averageMark = courses.mapNotNull { it.mark.removeSuffix("%").toFloatOrNull() }.average()
-                        val currentGpa = if (averageMark.isNaN()) "—" else "%.2f".format(percentToGpa(averageMark.toFloat()))
+                        val averageMark = UsatCalculations.weightedAssessmentPercent(data.assessments.filter { assessment -> courses.any { it.code == assessment.courseCode } })
+                        val currentGpa = averageMark?.let { "%.2f".format(percentToGpa(it)) } ?: "—"
                         item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             CourseOverviewMetric("Active courses", courses.size.toString(), "in this academic period", Icons.Default.MenuBook, Amber, Modifier.weight(1f))
-                            CourseOverviewMetric("Current GPA", currentGpa, if (averageMark.isNaN()) "Add assessment results" else "Based on current marks", Icons.Default.School, Navy, Modifier.weight(1f))
+                            CourseOverviewMetric("Current GPA", currentGpa, if (averageMark == null) "Add assessment results" else "Based on current marks", Icons.Default.School, Navy, Modifier.weight(1f))
                         } }
                         item { CourseSectionHeading(academicPeriod) }
                         val filteredCourses = courses.filter { "${it.code} ${it.name}".contains(courseQuery.trim(), ignoreCase = true) }
                         val selectedCourse = filteredCourses.firstOrNull { it.code == selectedCourseCode } ?: filteredCourses.firstOrNull()
-                        if (filteredCourses.isEmpty()) item { EmptyState("No matching courses", "Try a different search or add this course.") }
+                        if (filteredCourses.isEmpty()) item { EmptyState(if (courses.isEmpty()) "No courses in this period" else "No matching courses", if (courses.isEmpty()) "Add a course to start recording targets, sessions, and assessments." else "Try a different search or add this course.") }
                         else item { Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             filteredCourses.forEach { course ->
-                                val dueTasks = tasks.filter { !it.done && it.course.contains(course.code, true) }
+                                val dueTasks = tasks.filter { !it.done && it.courseCode == course.code }.sortedBy { it.dueAtMillis ?: Long.MAX_VALUE }
                                 CourseCard(course, selected = selectedCourse?.code == course.code, dueSoonCount = dueTasks.size, dueSoonTask = dueTasks.firstOrNull()) { selectedCourseCode = course.code }
                             }
                         } }
                         if (selectedCourse != null) {
-                            item { CoursePerformanceCard(selectedCourse) }
-                            item { TargetEditorCard(selectedCourse, onTargetChange = { target -> courses = courses.map { if (it.code == selectedCourse.code) it.copy(target = target) else it } }) }
+                            val selectedEntity = data.courses.first { it.code == selectedCourse.code }
+                            val courseAssessments = data.assessments.filter { it.courseCode == selectedCourse.code }
+                            item { CoursePerformanceCard(selectedCourse, courseAssessments, onAddAssessment = { assessmentToEdit = null; showAddAssessment = true }, onEditAssessment = { assessmentToEdit = it; showAddAssessment = true }, onDeleteAssessment = { viewModel.deleteAssessment(it.id) }, onEditCourse = { courseToEdit = selectedEntity; showAddCourse = true }, onDeleteCourse = { viewModel.deleteCourse(selectedCourse.code); selectedCourseCode = "" }) }
+                            item { TargetEditorCard(selectedCourse, onTargetChange = { target -> viewModel.changeTarget(selectedCourse.code, target) }) }
                             item { CourseInsightCard(selectedCourse) }
                             item { SectionTitle("Upcoming coursework", "Assignments and tasks for ${selectedCourse.code}") }
-                            val courseTasks = tasks.filter { !it.done && it.course.contains(selectedCourse.code, true) }
+                            val courseTasks = tasks.filter { !it.done && it.courseCode == selectedCourse.code }
                             if (courseTasks.isEmpty()) item { EmptyState("No upcoming coursework", "Add an activity and assign it to ${selectedCourse.code} to see it here.") }
-                            else items(courseTasks) { task -> TaskCard(task) { tasks = tasks.map { t -> if (t.id == task.id) t.copy(done = !t.done) else t } } }
+                            else items(courseTasks) { task -> TaskCard(task, onToggle = { viewModel.setActivityCompleted(task.id, !task.done) }, onEdit = { activityToEdit = data.activities.firstOrNull { it.id == task.id }; showAdd = true }, onDelete = { viewModel.deleteActivity(task.id) }) }
                         }
                     }
                     Page.Analytics -> {
@@ -226,47 +288,96 @@ private fun UsatApp() {
                             }
                         }
                         val analyticsCourses = if (analyticsCourse == "All courses") courses else courses.filter { it.code == analyticsCourse }
-                        val periodMultiplier = when (analyticsPeriod) { "This month" -> 4f; "This semester" -> 16f; "This academic year" -> 32f; else -> 1f }
-                        val weeklyStudy = analyticsCourses.sumOf { it.studied.toDouble() }.toFloat() * periodMultiplier
-                        val targetStudy = analyticsCourses.sumOf { it.target.toDouble() }.toFloat() * periodMultiplier
-                        val averageMark = analyticsCourses.mapNotNull { it.mark.removeSuffix("%").toFloatOrNull() }.average().takeIf { !it.isNaN() }?.toFloat() ?: 0f
-                        val gpa = percentToGpa(averageMark)
+                        val range = analyticsRange(analyticsPeriod, LocalDate.now(), academicPeriod)
+                        val selectedCodes = analyticsCourses.map { it.code }.toSet()
+                        val analyticsSessions = data.sessions.filter { it.state == "completed" && it.endedAtMillis != null && it.startedAtMillis in range.first..range.second && (analyticsCourse == "All courses" || it.courseCode in selectedCodes) }
+                        val analyticsAssessments = data.assessments.filter { it.recordedAtMillis in range.first..range.second && (analyticsCourse == "All courses" || it.courseCode in selectedCodes) }
+                        val weeklyStudy = UsatCalculations.completedStudyHours(analyticsSessions)
+                        val selectedWeeklyGoal = if (analyticsCourse == "All courses") weeklyStudyGoal else analyticsCourses.sumOf { it.target.toDouble() }.toFloat()
+                        val targetStudy = selectedWeeklyGoal * (ChronoUnit.DAYS.between(Instant.ofEpochMilli(range.first).atZone(ZoneId.systemDefault()).toLocalDate(), Instant.ofEpochMilli(range.second).atZone(ZoneId.systemDefault()).toLocalDate()).coerceAtLeast(1).toFloat() / 7f)
+                        val averageMark = UsatCalculations.weightedAssessmentPercent(analyticsAssessments)
+                        val gpa = averageMark?.let(::percentToGpa)
                         item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            AnalyticsSummaryCard("Current GPA", "${"%.2f".format(gpa)}", "Based on ${analyticsCourses.size} selected course${if (analyticsCourses.size == 1) "" else "s"}", Modifier.weight(1f), Navy, Icons.Default.School)
-                            AnalyticsSummaryCard(if (analyticsPeriod == "This week") "Weekly study" else "Study hours", "${weeklyStudy.prettyHours()}h", "Target: ${targetStudy.prettyHours()} hours", Modifier.weight(1f), Amber, Icons.Default.AccessTime)
+                            AnalyticsSummaryCard("Current GPA", gpa?.let { "${"%.2f".format(it)}" } ?: "—", if (gpa == null) "Record assessment results to calculate GPA" else "From ${analyticsAssessments.size} recorded result${if (analyticsAssessments.size == 1) "" else "s"}", Modifier.weight(1f), Navy, Icons.Default.School)
+                            AnalyticsSummaryCard("Study time", "${weeklyStudy.prettyHours()}h", if (targetStudy > 0f) "Weekly targets prorated to period: ${targetStudy.prettyHours()}h" else "No course targets in this selection", Modifier.weight(1f), Amber, Icons.Default.AccessTime)
                         } }
                         item { AnalyticsInsightCard(performanceInsight(analyticsCourses, weeklyStudy, targetStudy), showAnalyticsEvidence, onToggleEvidence = { showAnalyticsEvidence = !showAnalyticsEvidence }) }
-                        item { PerformanceStudyTrendCard(trendMode, onModeChange = { trendMode = it }, courses = analyticsCourses, period = analyticsPeriod) }
-                        item { TimeAllocationCard(periodMultiplier) }
+                        item { PerformanceStudyTrendCard(trendMode, onModeChange = { trendMode = it }, courses = analyticsCourses, period = analyticsPeriod, sessions = analyticsSessions, assessments = analyticsAssessments) }
+                        item { TimeAllocationCard(analyticsSessions, analyticsTasks = tasks.filter { it.dueAtMillis?.let { due -> due in range.first..range.second } == true }) }
                         item { SectionTitle("Course performance", "Grades compared with study-target completion") }
                         items(analyticsCourses) { course -> CourseAnalyticsCard(course) }
                         item { SectionTitle("Focus patterns", "Study intensity by time of day") }
-                        item { FocusPatternCard(analyticsPeriod) }
+                        item { FocusPatternCard(analyticsPeriod, analyticsSessions) }
                         item { PlanBuilderCard(onClick = { showPlanInfo = true }) }
                     }
                     Page.Advisor -> {
-                        item { BriefCard() }
-                        item { SectionTitle("Recommendations", "Based on your deadlines and study targets") }
-                        item { RecommendationCard("Protect a 60-minute study block before 4 PM.", "Your Database Systems assignment is due tonight and is 68% complete. Finishing before Robotics Club leaves a 2.5-hour safety buffer.") }
-                        item { RecommendationCard("Add one calculus review session this week.", "You have completed 4 of your 6 target hours. A focused session will help you reach your weekly goal before the next assessment.") }
-                        item { Text("Recommendations are illustrative sample content. Connect an AI service to generate advice from real student data.", color = Muted, fontSize = 12.sp) }
+                        item { SectionTitle("AI Advisor", "Personalized advice is not connected yet") }
+                        item { EmptyState("No generated recommendations", "Your courses, activities, and study records are saved locally. AI advice will appear here after a real recommendation service is connected.") }
+                    }
+                    Page.Profiles -> {
+                        item { SectionTitle("Student profile", if (data.studentProfile == null) "Create your local student and academic profile" else "Student details and academic records") }
+                        if (data.profiles.isEmpty()) {
+                            item { EmptyState("No student profile yet", "Add your personal and university information with your first academic record.") }
+                        } else {
+                            items(data.profiles, key = { "profile-${it.id}" }) { profile ->
+                                ProfileListItem(profile = profile, courseCount = data.profileCourses.count { it.profileId == profile.id }, selected = activeProfile?.id == profile.id) {
+                                    viewModel.selectAcademicProfile(profile.id)
+                                }
+                            }
+                        }
+                        item { Button(onClick = { profileToEdit = null; page = Page.ProfileForm }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Navy, contentColor = Color.White)) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(8.dp)); Text(if (data.studentProfile == null) "Create Student Profile" else "Add Academic Profile") } }
+                    }
+                    Page.Profile -> {
+                        val profileCourses = data.courses.filter { course -> data.profileCourses.any { it.profileId == activeProfile?.id && it.courseCode == course.code } }
+                        if (activeProfile == null) {
+                            item { EmptyState("No academic profile selected", "Create an academic profile to get started.") }
+                            item { Button(onClick = { profileToEdit = null; page = Page.ProfileForm }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Navy, contentColor = Color.White)) { Text(if (data.studentProfile == null) "Create Student Profile" else "Add Academic Profile") } }
+                        } else {
+                            item { AcademicProfileDetailsCard(student = data.studentProfile, profile = activeProfile, courses = profileCourses, onEdit = { profileToEdit = activeProfile; page = Page.ProfileForm }, onCreateNew = { profileToEdit = null; page = Page.ProfileForm }, onAllProfiles = { page = Page.Profiles }) }
+                        }
+                    }
+                    Page.ProfileForm -> {
+                        item { SectionTitle(when { profileToEdit != null -> "Edit student and academic profile"; data.studentProfile == null -> "Create student profile"; else -> "Add academic profile" }, "Personal details are shared across your academic records") }
+                        item {
+                            AcademicProfileFormCard(
+                                studentProfile = data.studentProfile,
+                                profile = profileToEdit,
+                                courses = data.courses,
+                                selectedCourseCodes = data.profileCourses.filter { it.profileId == profileToEdit?.id }.map { it.courseCode }.toSet(),
+                                onSave = viewModel::saveStudentAcademicProfile,
+                                onAddCourse = { showAddCourse = true },
+                                onCancel = { page = if (profileToEdit == null) Page.Profiles else Page.Profile; profileToEdit = null }
+                            )
+                        }
                     }
                 }
             }
         }
         }
     }
-    if (!showWelcome && showAdd) AddActivityDialog(courses = courses, onDismiss = { showAdd = false }, onSave = { title, course, due, type, priority, smartReminder ->
-        val plannedHours = when (type) { "Academic task", "Class or assignment", "Study session" -> 1.5f; else -> 1f }
-        tasks = tasks + StudyTask((tasks.maxOfOrNull { it.id } ?: 0) + 1, title, course, due.ifBlank { "No due date" }, priority, type, smartReminder, plannedHours)
+    if (!showWelcome && showAdd) AddActivityDialog(courses = courses, initial = activityToEdit, onDismiss = { showAdd = false; activityToEdit = null }, onSave = { activity ->
+        if (activity.id == 0L) viewModel.addActivity(activity) else viewModel.updateActivity(activity)
         showAdd = false
+        activityToEdit = null
     })
-    if (!showWelcome && showAddCourse) AddCourseDialog(onDismiss = { showAddCourse = false }, onSave = { code, name, target ->
-        courses = courses + Course(code, name, 0f, target, "N/A", "N/A")
+    if (!showWelcome && showAddCourse) AddCourseDialog(initial = courseToEdit, period = academicPeriod, onDismiss = { showAddCourse = false; courseToEdit = null }, onSave = { code, name, target ->
+        val existing = courseToEdit
+        if (existing == null) viewModel.addCourse(code, name, target, academicPeriod) else viewModel.updateCourse(existing.copy(name = name, weeklyTargetHours = target))
         selectedCourseCode = code
         courseQuery = ""
         showAddCourse = false
+        courseToEdit = null
     })
+    if (!showWelcome && showAddAssessment) {
+        val selectedCourse = courses.firstOrNull { it.code == selectedCourseCode }
+        if (selectedCourse != null) AddAssessmentDialog(selectedCourse, assessmentToEdit, onDismiss = { showAddAssessment = false; assessmentToEdit = null }, onSave = { title, score, maxScore ->
+            val old = assessmentToEdit
+            val record = if (old == null) AssessmentEntity(courseCode = selectedCourse.code, title = title, score = score, maxScore = maxScore) else old.copy(title = title, score = score, maxScore = maxScore)
+            if (old == null) viewModel.addAssessment(record) else viewModel.updateAssessment(record)
+            showAddAssessment = false
+            assessmentToEdit = null
+        })
+    }
     if (!showWelcome && showNotifications) AlertDialog(
         onDismissRequest = { showNotifications = false },
         icon = { Icon(Icons.Default.NotificationsNone, null, tint = Navy) },
@@ -285,25 +396,200 @@ private fun UsatApp() {
     )
 }
 
-@Composable private fun WelcomeScreen(onContinue: () -> Unit) {
+@Composable private fun WelcomeScreen(hasProfile: Boolean, onContinue: () -> Unit) {
     Box(Modifier.fillMaxSize().background(Navy), contentAlignment = Alignment.Center) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Image(painterResource(R.drawable.usat_mark), "USAT", Modifier.size(148.dp).clip(RoundedCornerShape(32.dp)), contentScale = ContentScale.Crop)
             Text("Welcome to USAT", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
-            Text("Your studies, activities, and goals in one place.", color = Color(0xFFD4DAE5), fontSize = 14.sp, lineHeight = 21.sp)
+            Text(if (hasProfile) "Your studies, activities, and goals in one place." else "Create your academic profile to start tracking courses and study goals.", color = Color(0xFFD4DAE5), fontSize = 14.sp, lineHeight = 21.sp)
             Spacer(Modifier.height(8.dp))
             Button(onClick = onContinue, colors = ButtonDefaults.buttonColors(containerColor = Amber, contentColor = Navy), modifier = Modifier.fillMaxWidth()) {
-                Text("Open my dashboard", fontWeight = FontWeight.Bold, modifier = Modifier.padding(vertical = 5.dp))
+                Text(if (hasProfile) "Open my dashboard" else "Create academic profile", fontWeight = FontWeight.Bold, modifier = Modifier.padding(vertical = 5.dp))
             }
         }
     }
 }
 
+@Composable private fun AcademicProfileFormCard(
+    studentProfile: StudentProfileEntity?,
+    profile: AcademicProfileEntity?,
+    courses: List<CourseEntity>,
+    selectedCourseCodes: Set<String>,
+    onSave: (StudentProfileEntity, AcademicProfileEntity, List<String>) -> Unit,
+    onAddCourse: () -> Unit,
+    onCancel: () -> Unit
+) {
+    var username by remember(studentProfile?.id, profile?.id) { mutableStateOf(studentProfile?.username.orEmpty()) }
+    var fullName by remember(studentProfile?.id, profile?.id) { mutableStateOf(studentProfile?.fullName.orEmpty()) }
+    var email by remember(studentProfile?.id, profile?.id) { mutableStateOf(studentProfile?.email.orEmpty()) }
+    var phone by remember(studentProfile?.id, profile?.id) { mutableStateOf(studentProfile?.phoneNumber.orEmpty()) }
+    var university by remember(studentProfile?.id, profile?.id) { mutableStateOf(studentProfile?.universityName.orEmpty()) }
+    var faculty by remember(studentProfile?.id, profile?.id) { mutableStateOf(studentProfile?.faculty.orEmpty()) }
+    var programme by remember(studentProfile?.id, profile?.id) { mutableStateOf(studentProfile?.programme.orEmpty()) }
+    var registrationNumber by remember(studentProfile?.id, profile?.id) { mutableStateOf(studentProfile?.registrationNumber.orEmpty()) }
+    var academicYear by remember(profile?.id) { mutableStateOf(profile?.academicYear.orEmpty()) }
+    var yearOfStudy by remember(profile?.id) { mutableStateOf(profile?.yearOfStudy.orEmpty()) }
+    var semester by remember(profile?.id) { mutableStateOf(profile?.semester.orEmpty()) }
+    var weeklyGoal by remember(profile?.weeklyStudyGoalHours) { mutableStateOf(profile?.weeklyStudyGoalHours?.prettyHours().orEmpty()) }
+    var selectedCodes by remember(profile?.id) { mutableStateOf(selectedCourseCodes) }
+    SurfaceCard {
+        Text("Personal information", color = Navy, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        OutlinedTextField(username, { username = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Username *") }, singleLine = true, supportingText = { Text("3–24 letters, numbers, dots, underscores, or hyphens") })
+        OutlinedTextField(fullName, { fullName = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Full name *") }, singleLine = true)
+        OutlinedTextField(email, { email = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Email address (optional)") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email))
+        OutlinedTextField(phone, { phone = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Phone number (optional)") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone))
+
+        Text("University information", color = Navy, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        OutlinedTextField(university, { university = it }, modifier = Modifier.fillMaxWidth(), label = { Text("University or institution *") }, singleLine = true)
+        OutlinedTextField(faculty, { faculty = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Faculty or school *") }, singleLine = true)
+        OutlinedTextField(programme, { programme = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Programme or degree *") }, singleLine = true)
+        OutlinedTextField(registrationNumber, { registrationNumber = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Student registration number (optional)") }, singleLine = true)
+
+        Text("Academic information", color = Navy, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        OutlinedTextField(yearOfStudy, { yearOfStudy = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Year of study *") }, placeholder = { Text("Third Year") }, singleLine = true)
+        OutlinedTextField(
+            value = academicYear,
+            onValueChange = { academicYear = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("Academic year *") },
+            placeholder = { Text("2026/2027") },
+            singleLine = true
+        )
+        OutlinedTextField(semester, { semester = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Semester or term (optional)") }, placeholder = { Text("Semester 1") }, singleLine = true)
+        OutlinedTextField(
+            value = weeklyGoal,
+            onValueChange = { weeklyGoal = it.filter { ch -> ch.isDigit() || ch == '.' } },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("Weekly study-hour target *") },
+            placeholder = { Text("12") },
+            suffix = { Text("hours") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
+        )
+        Text("Your target is saved as hours per week.", color = Muted, fontSize = 10.sp)
+
+        Text("Courses associated with this academic record", color = Navy, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+            Column(Modifier.weight(1f)) {
+                Text("Choose the courses for this year and term.", color = Muted, fontSize = 10.sp)
+            }
+            TextButton(onClick = onAddCourse) { Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp)); Text("Add course") }
+        }
+        if (courses.isEmpty()) {
+            Text("No courses added yet", color = Muted, fontSize = 12.sp)
+        } else {
+            courses.forEach { course ->
+                Row(Modifier.fillMaxWidth().background(Canvas, RoundedCornerShape(11.dp)).clickable {
+                    selectedCodes = if (course.code in selectedCodes) selectedCodes - course.code else selectedCodes + course.code
+                }.padding(start = 12.dp, end = 5.dp, top = 5.dp, bottom = 5.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Column(Modifier.weight(1f)) {
+                        Text(course.name, color = Navy, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                        Text("${course.code} · ${course.academicPeriod}", color = Muted, fontSize = 9.sp)
+                    }
+                    Text("${course.weeklyTargetHours.prettyHours()}h/week", color = Navy, fontSize = 10.sp, fontWeight = FontWeight.Medium)
+                    Checkbox(checked = course.code in selectedCodes, onCheckedChange = { checked -> selectedCodes = if (checked) selectedCodes + course.code else selectedCodes - course.code })
+                }
+            }
+        }
+        Button(onClick = {
+            val student = StudentProfileEntity(
+                username = username,
+                fullName = fullName,
+                email = email,
+                phoneNumber = phone,
+                universityName = university,
+                faculty = faculty,
+                programme = programme,
+                registrationNumber = registrationNumber
+            )
+            val academic = AcademicProfileEntity(
+                id = profile?.id ?: 0L,
+                academicYear = academicYear,
+                weeklyStudyGoalHours = weeklyGoal.toFloatOrNull() ?: 0f,
+                yearOfStudy = yearOfStudy,
+                semester = semester
+            )
+            onSave(student, academic, selectedCodes.toList())
+        }, modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Navy, contentColor = Color.White)
+        ) {
+            Text("Save profile", fontWeight = FontWeight.Bold, modifier = Modifier.padding(vertical = 3.dp))
+        }
+        TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.End)) { Text("Cancel", color = Muted) }
+    }
+}
+
+@Composable private fun AcademicProfileDetailsCard(
+    student: StudentProfileEntity?,
+    profile: AcademicProfileEntity,
+    courses: List<CourseEntity>,
+    onEdit: () -> Unit,
+    onCreateNew: () -> Unit,
+    onAllProfiles: () -> Unit
+) {
+    SurfaceCard {
+        Text("Student profile", color = Amber, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = .8.sp)
+        Text(student?.fullName ?: "Student details not entered", color = Navy, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        if (student != null) {
+            Text("@${student.username}", color = Muted, fontSize = 12.sp)
+            Text("${student.universityName} · ${student.faculty}", color = Navy, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            Text(student.programme, color = Muted, fontSize = 11.sp)
+            student.email?.let { Text(it, color = Muted, fontSize = 11.sp) }
+            student.phoneNumber?.let { Text(it, color = Muted, fontSize = 11.sp) }
+            student.registrationNumber?.let { Text("Registration number · $it", color = Muted, fontSize = 10.sp) }
+        }
+        HorizontalDivider(color = Line)
+        Text("Academic record", color = Amber, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = .8.sp)
+        Text(profile.yearOfStudy ?: profile.academicYear, color = Navy, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        Text("Academic year · ${profile.academicYear}" + (profile.semester?.let { " · $it" } ?: ""), color = Muted, fontSize = 11.sp)
+        Row(Modifier.fillMaxWidth().background(Canvas, RoundedCornerShape(12.dp)).padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+            Column {
+                Text("WEEKLY STUDY GOAL", color = Muted, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = .5.sp)
+                Text("${profile.weeklyStudyGoalHours.prettyHours()} hours/week", color = Navy, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+            }
+            Icon(Icons.Default.Flag, null, tint = Amber, modifier = Modifier.size(25.dp))
+        }
+        Text("Courses · ${courses.size}", color = Navy, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        if (courses.isEmpty()) Text("No courses associated with this profile yet.", color = Muted, fontSize = 12.sp)
+        else courses.forEach { course ->
+            Row(Modifier.fillMaxWidth().background(Canvas, RoundedCornerShape(10.dp)).padding(horizontal = 12.dp, vertical = 10.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(course.name, color = Navy, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Text("${course.code} · ${course.academicPeriod}", color = Muted, fontSize = 9.sp)
+                }
+                Text("${course.weeklyTargetHours.prettyHours()}h target", color = Navy, fontSize = 10.sp)
+            }
+        }
+        Button(onClick = onEdit, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Navy, contentColor = Color.White)) { Icon(Icons.Default.Edit, null); Spacer(Modifier.width(8.dp)); Text("Edit Profile") }
+        TextButton(onClick = onCreateNew, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(5.dp)); Text("Add Academic Profile") }
+        TextButton(onClick = onAllProfiles, modifier = Modifier.align(Alignment.End)) { Text("All profiles", color = Muted) }
+    }
+}
+
+@Composable private fun ProfileListItem(profile: AcademicProfileEntity, courseCount: Int, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        color = Color.White,
+        shape = RoundedCornerShape(16.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, if (selected) Amber else Line),
+        shadowElevation = 1.dp
+    ) {
+        Row(Modifier.padding(15.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Box(Modifier.size(42.dp).background(Color(0xFFFFF1D8), RoundedCornerShape(12.dp)), contentAlignment = Alignment.Center) { Icon(Icons.Default.School, null, tint = Navy) }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(profile.yearOfStudy ?: "Academic profile", color = Navy, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                Text("${profile.academicYear}${profile.semester?.let { " · $it" } ?: ""} · $courseCount courses · ${profile.weeklyStudyGoalHours.prettyHours()}h/week", color = Muted, fontSize = 10.sp)
+            }
+            Icon(Icons.Default.ChevronRight, null, tint = Muted)
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun Heading(page: Page) {
+@Composable private fun Heading(page: Page, studentName: String?) {
     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-        Text("MONDAY, 13 MAY", color = Amber, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.4.sp)
-        Text(if (page == Page.Overview) "Welcome, Moses" else page.label, color = Navy, fontSize = 27.sp, fontWeight = FontWeight.Bold, lineHeight = 32.sp)
+        Text(LocalDate.now().format(DateTimeFormatter.ofPattern("EEEE, d MMMM")).uppercase(), color = Amber, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.4.sp)
+        Text(if (page == Page.Overview) studentName?.let { "Welcome, $it" } ?: "Welcome" else page.label, color = Navy, fontSize = 27.sp, fontWeight = FontWeight.Bold, lineHeight = 32.sp)
         Text(if (page == Page.Overview) "Here’s what needs your attention today." else "A focused view of your ${page.label.lowercase()}.", color = Muted, fontSize = 13.sp)
     }
 }
@@ -314,23 +600,16 @@ private fun UsatApp() {
     }
 }
 
-@Composable private fun BriefCard() {
-    Surface(color = Navy, shape = RoundedCornerShape(18.dp)) {
-        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Icon(Icons.Default.AutoAwesome, null, tint = Amber, modifier = Modifier.size(18.dp)); Text("AI DAILY BRIEF", color = Amber, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.2.sp)
-            }
-            Text("Protect a 60-minute study block before 4 PM.", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold, lineHeight = 23.sp)
-            Text("Your Database Systems assignment is due tonight. Finishing it before Robotics Club gives you a 2.5-hour safety buffer.", color = Color(0xFFCBD3E1), fontSize = 12.sp, lineHeight = 18.sp)
-            Text("See why this was suggested  →", color = Amber, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-        }
-    }
-}
-
-@Composable private fun OverviewDailyBriefCard(tasks: List<StudyTask>, courses: List<Course>, showWhy: Boolean, onWhyClick: () -> Unit) {
+@Composable private fun OverviewDailyBriefCard(tasks: List<StudyTask>, courses: List<Course>, weeklyGoal: Float, showWhy: Boolean, onWhyClick: () -> Unit) {
     val openTasks = tasks.count { !it.done }
     val studiedHours = courses.sumOf { it.studied.toDouble() }.toFloat()
-    val targetHours = courses.sumOf { it.target.toDouble() }.toFloat()
+    val targetHours = weeklyGoal
+    val nextTask = tasks.filter { !it.done }.minByOrNull { it.dueAtMillis ?: Long.MAX_VALUE }
+    val recommendation = when {
+        nextTask != null -> "Review ${nextTask.title}"
+        targetHours > studiedHours -> "Plan a focused study block"
+        else -> "Your recorded study target is complete"
+    }
     Surface(color = Color.White, shape = RoundedCornerShape(20.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFF0EAE0)), shadowElevation = 3.dp) {
         Column(Modifier.fillMaxWidth()) {
             Box(Modifier.fillMaxWidth().height(3.dp).background(Amber))
@@ -338,16 +617,16 @@ private fun UsatApp() {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
                     Box(Modifier.size(34.dp).background(Color(0xFFFFF1D8), RoundedCornerShape(11.dp)), Alignment.Center) { Icon(Icons.Default.AutoAwesome, null, tint = Amber, modifier = Modifier.size(18.dp)) }
                     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text("AI DAILY BRIEF", color = Amber, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp)
-                        Text("Your next best move", color = Navy, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        Text("STUDY PLANNER", color = Amber, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp)
+                        Text("A quick look at your saved records", color = Navy, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                     }
                 }
-                Text("Protect a 60-minute study block before 4 PM.", color = Navy, fontSize = 15.sp, fontWeight = FontWeight.Bold, lineHeight = 20.sp)
-                Text("Your Database Systems assignment is due tonight. Finish before Robotics Club for a safer buffer.", color = Muted, fontSize = 10.sp, lineHeight = 14.sp)
+                Text(recommendation, color = Navy, fontSize = 15.sp, fontWeight = FontWeight.Bold, lineHeight = 20.sp)
+                Text(nextTask?.let { "Next open activity: ${it.title}${if (it.due.isNotBlank()) " · ${it.due}" else ""}." } ?: "No open activities are recorded.", color = Muted, fontSize = 10.sp, lineHeight = 14.sp)
                 Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFFFAF9F6))) {
                     BriefMetric("TASKS", "$openTasks left", Modifier.weight(1f))
                     BriefMetric("STUDY", "${studiedHours.prettyHours()} / ${targetHours.prettyHours()}h", Modifier.weight(1f))
-                    BriefMetric("NEXT EVENT", "9:00 AM", Modifier.weight(1f))
+                    BriefMetric("NEXT EVENT", nextTask?.due?.substringBefore(",") ?: "None", Modifier.weight(1f))
                 }
                 Row(Modifier.fillMaxWidth().clickable(onClick = onWhyClick).padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                     Text(if (showWhy) "Hide why this was recommended" else "See why this was recommended", color = Color(0xFF9A6000), fontWeight = FontWeight.Bold, fontSize = 10.sp)
@@ -356,10 +635,10 @@ private fun UsatApp() {
                 if (showWhy) {
                     val urgentTask = tasks.filter { !it.done }.maxByOrNull { when (it.priority) { "High" -> 3; "Medium" -> 2; else -> 1 } }
                     Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                        Text("Three factors shaped this suggestion", color = Navy, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                        RecommendationFactor("01", "Deadline pressure", urgentTask?.let { "${it.title} · ${it.priority} priority" } ?: "No urgent task right now")
+                        Text("Why this planner hint is shown", color = Navy, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        RecommendationFactor("01", "Open activity", urgentTask?.let { "${it.title} · ${it.priority} priority" } ?: "No urgent task right now")
                         RecommendationFactor("02", "Study progress", "${studiedHours.prettyHours()} of ${targetHours.prettyHours()} target hours completed.")
-                        RecommendationFactor("03", "Available time", "A focused block fits before your next planned commitment.")
+                        RecommendationFactor("03", "Recommendation source", "This is a local rule based on saved tasks and sessions; no AI service is connected.")
                     }
                 }
             }
@@ -427,17 +706,29 @@ private fun UsatApp() {
     }
 }
 
-@Composable private fun FocusCard(running: Boolean, seconds: Int, onToggle: () -> Unit, onReset: () -> Unit) {
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun FocusCard(running: Boolean, paused: Boolean, seconds: Int, onToggle: () -> Unit, onReset: () -> Unit, courses: List<Course>, selectedCourse: String, onCourseSelect: (String) -> Unit) {
+    var courseMenu by remember { mutableStateOf(false) }
     SurfaceCard {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("FOCUS SESSION", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
                 Text("%02d:%02d".format(seconds / 60, seconds % 60), color = Navy, fontSize = 28.sp, fontWeight = FontWeight.Bold)
-                Text(if (running) "Stay focused — you’ve got this." else "Ready for a productive block?", color = Muted, fontSize = 11.sp)
+                Text(if (running) "Session is being recorded." else "Focus time is recorded from session timestamps.", color = Muted, fontSize = 11.sp, maxLines = 2, lineHeight = 14.sp)
             }
             Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                Button(onClick = onToggle, colors = ButtonDefaults.buttonColors(containerColor = Amber, contentColor = Navy), contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)) { Icon(if (running) Icons.Default.Pause else Icons.Default.PlayArrow, null, modifier = Modifier.size(17.dp)); Spacer(Modifier.width(5.dp)); Text(if (running) "Pause" else "Start", fontWeight = FontWeight.Bold) }
-                TextButton(onClick = onReset, contentPadding = PaddingValues(0.dp)) { Text("Reset timer", color = Muted, fontSize = 11.sp) }
+                Button(onClick = onToggle, modifier = Modifier.height(42.dp).widthIn(min = 88.dp, max = 122.dp), colors = ButtonDefaults.buttonColors(containerColor = Amber, contentColor = Navy), contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp)) {
+                    Icon(if (running) Icons.Default.Pause else Icons.Default.PlayArrow, null, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)); Text(if (running) "Pause" else if (paused) "Resume" else "Start", maxLines = 1, softWrap = false, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+                TextButton(onClick = onReset, modifier = Modifier.height(30.dp), contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)) { Text("Finish session", color = Muted, fontSize = 9.sp, maxLines = 1, softWrap = false) }
+            }
+        }
+        if (courses.isNotEmpty()) {
+            ExposedDropdownMenuBox(expanded = courseMenu, onExpandedChange = { courseMenu = !courseMenu }) {
+                OutlinedTextField(courses.firstOrNull { it.code == selectedCourse }?.let { "${it.code} · ${it.name}" } ?: "No course", {}, readOnly = true, label = { Text("Session course") }, trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(courseMenu) }, modifier = Modifier.menuAnchor().fillMaxWidth(), singleLine = true)
+                ExposedDropdownMenu(expanded = courseMenu, onDismissRequest = { courseMenu = false }) {
+                    (listOf("No course") + courses.map { "${it.code} · ${it.name}" }).forEach { option -> DropdownMenuItem(text = { Text(option) }, onClick = { onCourseSelect(courses.firstOrNull { "${it.code} · ${it.name}" == option }?.code.orEmpty()); courseMenu = false }) }
+                }
             }
         }
     }
@@ -450,7 +741,7 @@ private fun UsatApp() {
     }
 }
 
-@Composable private fun TaskCard(task: StudyTask, onToggle: () -> Unit) {
+@Composable private fun TaskCard(task: StudyTask, onToggle: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit) {
     SurfaceCard {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Checkbox(checked = task.done, onCheckedChange = { onToggle() }, colors = CheckboxDefaults.colors(checkedColor = Amber, uncheckedColor = Color(0xFFB9C0CA), checkmarkColor = Navy), modifier = Modifier.size(27.dp))
@@ -459,28 +750,27 @@ private fun UsatApp() {
                 Text("${task.course}  ·  ${task.due}", color = Muted, fontSize = 10.sp)
                 Text("${task.type}${if (task.smartReminder) " · Smart reminder" else ""}", color = Muted, fontSize = 9.sp)
             }
-            Surface(color = if (task.priority == "High") Color(0xFFFFF0EB) else Color(0xFFFFF4DC), shape = CircleShape) {
-                Text(task.priority.uppercase(), Modifier.padding(horizontal = 8.dp, vertical = 5.dp), color = if (task.priority == "High") Color(0xFFB84A2F) else Color(0xFF9A6000), fontSize = 8.sp, fontWeight = FontWeight.ExtraBold)
+            Column(horizontalAlignment = Alignment.End) {
+                Surface(color = if (task.priority == "High") Color(0xFFFFF0EB) else Color(0xFFFFF4DC), shape = CircleShape) {
+                    Text(task.priority.uppercase(), Modifier.padding(horizontal = 8.dp, vertical = 5.dp), color = if (task.priority == "High") Color(0xFFB84A2F) else Color(0xFF9A6000), fontSize = 8.sp, fontWeight = FontWeight.ExtraBold)
+                }
+                Row {
+                    IconButton(onClick = onEdit, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.Edit, "Edit activity", tint = Muted, modifier = Modifier.size(16.dp)) }
+                    IconButton(onClick = onDelete, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.DeleteOutline, "Delete activity", tint = Muted, modifier = Modifier.size(16.dp)) }
+                }
             }
         }
     }
 }
 
-@Composable private fun EventCard(time: String, title: String, detail: String, tone: Color) {
-    SurfaceCard {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Column(Modifier.width(76.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) { Text(time.substringBefore(" – "), color = Navy, fontSize = 12.sp, fontWeight = FontWeight.Bold); if (" – " in time) Text(time.substringAfter(" – "), color = Muted, fontSize = 10.sp) }
-            Box(Modifier.width(3.dp).height(46.dp).background(tone, RoundedCornerShape(2.dp)))
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) { Text(title, color = Navy, fontSize = 13.sp, fontWeight = FontWeight.SemiBold); Text(detail, color = Muted, fontSize = 10.sp) }
-        }
-    }
-}
-
-@Composable private fun EventsWeekHeader(onAdd: () -> Unit) {
+@Composable private fun EventsWeekHeader(onAdd: () -> Unit, date: LocalDate) {
+    val start = date.with(java.time.DayOfWeek.MONDAY)
+    val end = start.plusDays(6)
+    val dateLabel = "${start.format(DateTimeFormatter.ofPattern("d MMM"))} – ${end.format(DateTimeFormatter.ofPattern("d MMM yyyy"))}"
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
         Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            Text("13 – 19 May 2024", color = Navy, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-            Text("This week", color = Muted, fontSize = 10.sp)
+            Text(dateLabel, color = Navy, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text(if (date.with(java.time.DayOfWeek.MONDAY) == LocalDate.now().with(java.time.DayOfWeek.MONDAY)) "This week · tap a date to view its plan" else "Selected week · tap a date to view its plan", color = Muted, fontSize = 10.sp)
         }
         IconButton(onClick = onAdd, modifier = Modifier.size(42.dp).background(Amber, RoundedCornerShape(13.dp))) {
             Icon(Icons.Default.Add, "Add event", tint = Navy)
@@ -488,20 +778,21 @@ private fun UsatApp() {
     }
 }
 
-@Composable private fun WeekStrip() {
-    val days = listOf("Mon" to "13", "Tue" to "14", "Wed" to "15", "Thu" to "16", "Fri" to "17", "Sat" to "18", "Sun" to "19")
+@Composable private fun WeekStrip(date: LocalDate, onSelect: (LocalDate) -> Unit) {
+    val start = date.with(java.time.DayOfWeek.MONDAY)
+    val days = (0..6).map { start.plusDays(it.toLong()) }
     Surface(color = Color.White, shape = RoundedCornerShape(18.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFF0EAE0)), shadowElevation = 2.dp) {
         Row(Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-            days.forEachIndexed { index, (label, date) ->
-                val selected = index == 0
+            days.forEach { day ->
+                val selected = day == date
                 Column(
-                    Modifier.weight(1f).clip(RoundedCornerShape(13.dp)).background(if (selected) Navy else Color.Transparent).padding(vertical = 8.dp),
+                    Modifier.weight(1f).clip(RoundedCornerShape(13.dp)).clickable { onSelect(day) }.background(if (selected) Navy else Color.Transparent).padding(vertical = 8.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
-                    Text(label, color = if (selected) Amber else Muted, fontSize = 8.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium)
-                    Text(date, color = if (selected) Color.White else Navy, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                    Box(Modifier.size(4.dp).background(if (index < 6) Amber else Color.Transparent, CircleShape))
+                    Text(day.format(DateTimeFormatter.ofPattern("EEE")), color = if (selected) Amber else Muted, fontSize = 8.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium)
+                    Text(day.dayOfMonth.toString(), color = if (selected) Color.White else Navy, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    Box(Modifier.size(4.dp).background(if (day == LocalDate.now()) Amber else Color.Transparent, CircleShape))
                 }
             }
         }
@@ -523,12 +814,13 @@ private fun UsatApp() {
     }
 }
 
-@Composable private fun TodayPlanHeader() {
+@Composable private fun TodayPlanHeader(date: LocalDate) {
+    val isToday = date == LocalDate.now()
     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
         Surface(color = Color(0xFFFFF1D8), shape = CircleShape) {
-            Text("MONDAY, MAY 13", Modifier.padding(horizontal = 9.dp, vertical = 5.dp), color = Color(0xFF9A6000), fontSize = 8.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = .5.sp)
+            Text(date.format(DateTimeFormatter.ofPattern("EEEE, MMM d")).uppercase(), Modifier.padding(horizontal = 9.dp, vertical = 5.dp), color = Color(0xFF9A6000), fontSize = 8.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = .5.sp)
         }
-        Text("Today’s plan", color = Navy, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        Text(if (isToday) "Today’s plan" else "Selected day’s plan", color = Navy, fontSize = 18.sp, fontWeight = FontWeight.Bold)
         Text("Your activities, grouped by category", color = Muted, fontSize = 10.sp)
     }
 }
@@ -552,6 +844,54 @@ private fun categoryFor(type: String): String = when (type) {
     "Study session" -> "Study"
     "Extracurricular task" -> "Extracurricular"
     else -> "Personal"
+}
+
+private fun currentDefaultPeriod(): String {
+    val today = LocalDate.now()
+    val startYear = if (today.monthValue < 7) today.year - 1 else today.year
+    val semester = if (today.monthValue < 7) 2 else 1
+    return "Semester $semester · $startYear/${(startYear + 1) % 100}"
+}
+
+private fun analyticsRange(period: String, today: LocalDate, academicPeriod: String): Pair<Long, Long> {
+    val start = when (period) {
+        "This month" -> today.withDayOfMonth(1)
+        "This semester" -> {
+            val match = Regex("(\\d{4})/(\\d{2,4})").find(academicPeriod)
+            val year = match?.groupValues?.get(1)?.toIntOrNull() ?: today.year
+            val semester = Regex("Semester (\\d)").find(academicPeriod)?.groupValues?.get(1)?.toIntOrNull() ?: if (today.monthValue < 7) 2 else 1
+            LocalDate.of(if (semester == 1) year else year + 1, if (semester == 1) 1 else 7, 1)
+        }
+        "This academic year" -> LocalDate.of(today.year, 1, 1)
+        else -> today.with(java.time.DayOfWeek.MONDAY)
+    }
+    val endExclusive = when (period) {
+        "This month" -> start.plusMonths(1)
+        "This semester" -> start.plusMonths(6)
+        "This academic year" -> start.plusYears(1)
+        else -> start.plusWeeks(1)
+    }
+    val zone = ZoneId.systemDefault()
+    return start.atStartOfDay(zone).toInstant().toEpochMilli() to endExclusive.atStartOfDay(zone).toInstant().toEpochMilli()
+}
+
+@Composable private fun StudySessionEventCard(session: StudySessionEntity) {
+    val elapsed = UsatViewModel.elapsedSeconds(session, System.currentTimeMillis())
+    val duration = (elapsed / 3600f)
+    SurfaceCard {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(Modifier.width(70.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(Instant.ofEpochMilli(session.startedAtMillis).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("HH:mm")), color = Navy, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Text("${duration.prettyHours()}h", color = Muted, fontSize = 9.sp)
+            }
+            Box(Modifier.width(3.dp).height(44.dp).background(Navy, RoundedCornerShape(2.dp)))
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text("STUDY SESSION", color = Navy, fontSize = 8.sp, fontWeight = FontWeight.ExtraBold)
+                Text(session.courseCode ?: "Independent study", color = Navy, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Text(if (session.state == "active") "In progress" else "Recorded", color = Muted, fontSize = 9.sp)
+            }
+        }
+    }
 }
 
 @Composable private fun BalanceCard(academic: Float, study: Float, extracurricular: Float) {
@@ -601,6 +941,7 @@ private fun categoryFor(type: String): String = when (type) {
     val studied = courses.sumOf { it.studied.toDouble() }.toFloat()
     val reminders = tasks.count { !it.done && it.smartReminder }
     val advice = when {
+        extracurricular <= 0f -> "Add a personal or extracurricular activity to compare how your planned week is balanced."
         ratio > 3f -> "Your academic commitments are more than three times your extracurricular time. Consider protecting a short recovery block this week."
         ratio < 1.5f -> "Extracurricular commitments are taking a larger share of the week. Reserve time for upcoming coursework and study targets."
         studied < target -> "Your weekly balance looks healthy. You have ${(target - studied).prettyHours()} study-target hours left; protect an open block before adding more commitments."
@@ -608,9 +949,9 @@ private fun categoryFor(type: String): String = when (type) {
     }
     Surface(color = Navy, shape = RoundedCornerShape(16.dp)) {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) { Icon(Icons.Default.AutoAwesome, null, tint = Amber); Text("AI EVENTS ADVISOR", color = Amber, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp) }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) { Icon(Icons.Default.TipsAndUpdates, null, tint = Amber); Text("PLANNING INSIGHT", color = Amber, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp) }
             Text(advice, color = Color.White, fontSize = 13.sp, lineHeight = 19.sp)
-            Text("Based on this week’s time ratio, study targets${if (reminders > 0) ", and $reminders smart reminder${if (reminders == 1) "" else "s"}" else ""}.", color = Color(0xFFCBD3E1), fontSize = 10.sp)
+            Text("Local summary based on this week’s planned activity hours and recorded study targets${if (reminders > 0) ". $reminders reminder preference${if (reminders == 1) "" else "s"} saved; notifications are not scheduled yet." else "."}", color = Color(0xFFCBD3E1), fontSize = 10.sp)
         }
     }
 }
@@ -623,7 +964,7 @@ private fun categoryFor(type: String): String = when (type) {
             }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                 Text("Smart reminders", color = Navy, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                Text(if (enabled) "$count active ${if (count == 1) "reminder" else "reminders"}" else "Off · no activities have reminders enabled", color = Muted, fontSize = 10.sp)
+                Text(if (enabled) "$count reminder ${if (count == 1) "preference" else "preferences"} saved · delivery not connected" else "Off · no activities have reminders enabled", color = Muted, fontSize = 10.sp)
             }
             Text(if (enabled) "ON" else "OFF", color = if (enabled) Green else Muted, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
         }
@@ -657,7 +998,8 @@ private fun categoryFor(type: String): String = when (type) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun PeriodPicker(selected: String, onSelect: (String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
-    val periods = listOf("Semester 1 · 2025/26", "Semester 2 · 2025/26", "Semester 1 · 2026/27", "Semester 2 · 2026/27", "Summer · 2025/26")
+    val year = LocalDate.now().year
+    val periods = (year - 2..year + 1).flatMap { y -> listOf("Semester 1 · $y/${(y + 1) % 100}", "Semester 2 · $y/${(y + 1) % 100}") }
     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
         Text("ACADEMIC PERIOD", color = Navy, fontSize = 8.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = .8.sp)
     ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = !expanded }) {
@@ -669,20 +1011,21 @@ private fun categoryFor(type: String): String = when (type) {
     }
 }
 
-@Composable private fun AddCourseDialog(onDismiss: () -> Unit, onSave: (String, String, Float) -> Unit) {
-    var code by remember { mutableStateOf("") }
-    var name by remember { mutableStateOf("") }
-    var target by remember { mutableStateOf("5") }
+@Composable private fun AddCourseDialog(initial: CourseEntity?, period: String, onDismiss: () -> Unit, onSave: (String, String, Float) -> Unit) {
+    var code by remember(initial?.code) { mutableStateOf(initial?.code.orEmpty()) }
+    var name by remember(initial?.code) { mutableStateOf(initial?.name.orEmpty()) }
+    var target by remember(initial?.code) { mutableStateOf(initial?.weeklyTargetHours?.prettyHours() ?: "5") }
     val targetHours = target.toFloatOrNull()?.takeIf { it in .5f..80f }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Add a course", color = Navy, fontWeight = FontWeight.Bold) },
+        title = { Text(if (initial == null) "Add a course" else "Edit course", color = Navy, fontWeight = FontWeight.Bold) },
         text = { Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedTextField(code, { code = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Course code") }, placeholder = { Text("e.g. CSC 320") }, singleLine = true)
+            OutlinedTextField(code, { if (initial == null) code = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Course code") }, placeholder = { Text("e.g. CSC 320") }, singleLine = true, readOnly = initial != null)
             OutlinedTextField(name, { name = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Course name") }, singleLine = true)
             OutlinedTextField(target, { target = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Weekly study target") }, suffix = { Text("hours") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+            Text("Academic period: $period", color = Muted, fontSize = 10.sp)
         } },
-        confirmButton = { TextButton(onClick = { if (code.isNotBlank() && name.isNotBlank() && targetHours != null) onSave(code.trim().uppercase(), name.trim(), targetHours) }, enabled = code.isNotBlank() && name.isNotBlank() && targetHours != null) { Text("Add course", color = Navy) } },
+        confirmButton = { TextButton(onClick = { if (code.isNotBlank() && name.isNotBlank() && targetHours != null) onSave(code.trim().uppercase(), name.trim(), targetHours) }, enabled = code.isNotBlank() && name.isNotBlank() && targetHours != null) { Text(if (initial == null) "Add course" else "Save changes", color = Navy) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = Muted) } },
         containerColor = Color.White
     )
@@ -753,9 +1096,18 @@ private fun categoryFor(type: String): String = when (type) {
     }
 }
 
-@Composable private fun CoursePerformanceCard(course: Course) {
+@Composable private fun CoursePerformanceCard(
+    course: Course,
+    assessments: List<AssessmentEntity>,
+    onAddAssessment: () -> Unit,
+    onEditAssessment: (AssessmentEntity) -> Unit,
+    onDeleteAssessment: (AssessmentEntity) -> Unit,
+    onEditCourse: () -> Unit,
+    onDeleteCourse: () -> Unit
+) {
     val current = course.mark.removeSuffix("%").toFloatOrNull()
     val previous = course.previousMark.removeSuffix("%").toFloatOrNull()
+    var confirmDelete by remember { mutableStateOf(false) }
     Surface(color = Color.White, shape = RoundedCornerShape(19.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFF0EAE0)), shadowElevation = 2.dp) {
       Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(11.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -781,10 +1133,30 @@ private fun categoryFor(type: String): String = when (type) {
                 Text(if (improving) "Improving · up ${change.prettyHours()} points" else "Needs attention · down ${(-change).prettyHours()} points", color = if (improving) Green else Color(0xFFB84A2F), fontWeight = FontWeight.SemiBold, fontSize = 9.sp)
             }
         } else {
-            Text("No assessment trend yet. Add results to track your academic progress.", color = Muted, fontSize = 10.sp)
+            Text("No assessment results recorded yet.", color = Muted, fontSize = 10.sp)
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = onAddAssessment, modifier = Modifier.weight(1f)) { Icon(Icons.Default.Add, null, modifier = Modifier.size(15.dp)); Spacer(Modifier.width(4.dp)); Text("Add result", fontSize = 10.sp) }
+            TextButton(onClick = onEditCourse) { Text("Edit course", fontSize = 10.sp) }
+            TextButton(onClick = { confirmDelete = true }) { Icon(Icons.Default.DeleteOutline, null, modifier = Modifier.size(15.dp)); Text("Delete", fontSize = 10.sp) }
+        }
+        if (assessments.isNotEmpty()) {
+            HorizontalDivider(color = Line)
+            Text("Recorded assessments", color = Navy, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            assessments.sortedByDescending { it.recordedAtMillis }.forEach { result ->
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(result.title, color = Navy, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                        Text("${result.score.prettyHours()} / ${result.maxScore.prettyHours()} · ${Instant.ofEpochMilli(result.recordedAtMillis).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("d MMM yyyy"))}", color = Muted, fontSize = 9.sp)
+                    }
+                    IconButton(onClick = { onEditAssessment(result) }, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.Edit, "Edit assessment", tint = Muted, modifier = Modifier.size(15.dp)) }
+                    IconButton(onClick = { onDeleteAssessment(result) }, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.DeleteOutline, "Delete assessment", tint = Muted, modifier = Modifier.size(15.dp)) }
+                }
+            }
         }
       }
     }
+    if (confirmDelete) AlertDialog(onDismissRequest = { confirmDelete = false }, title = { Text("Delete ${course.code}?") }, text = { Text("Its assessment results will be deleted. Linked activities and sessions will be kept without a course association.") }, confirmButton = { TextButton(onClick = { confirmDelete = false; onDeleteCourse() }) { Text("Delete") } }, dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } })
 }
 
 @Composable private fun TargetEditorCard(course: Course, onTargetChange: (Float) -> Unit) {
@@ -827,7 +1199,7 @@ private fun categoryFor(type: String): String = when (type) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box(Modifier.size(34.dp).background(Amber, RoundedCornerShape(10.dp)), Alignment.Center) { Icon(Icons.Default.AutoAwesome, null, tint = Navy, modifier = Modifier.size(17.dp)) }
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("AI COURSE INSIGHT", color = Amber, fontSize = 8.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = .8.sp)
+                    Text("COURSE PERFORMANCE NOTE", color = Amber, fontSize = 8.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = .8.sp)
                     Text(course.name, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
                 }
             }
@@ -857,7 +1229,7 @@ private fun percentToGpa(mark: Float): Float = when {
 
 private fun performanceInsight(courses: List<Course>, studyHours: Float, targetHours: Float): String {
     val marks = courses.mapNotNull { it.mark.removeSuffix("%").toFloatOrNull() }
-    if (marks.isEmpty()) return "Add course assessment results to receive performance insights. This view uses sample course data."
+    if (marks.isEmpty()) return "Add assessment results and complete focus sessions to see insights from your recorded data."
     val average = marks.average()
     val completion = if (targetHours > 0f) (studyHours / targetHours * 100).toInt() else 0
     return when {
@@ -900,8 +1272,8 @@ private fun performanceInsight(courses: List<Course>, studyHours: Float, targetH
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
                 Box(Modifier.size(36.dp).background(Amber, RoundedCornerShape(11.dp)), Alignment.Center) { Icon(Icons.Default.AutoAwesome, null, tint = Navy, modifier = Modifier.size(18.dp)) }
                 Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    Text("AI PERFORMANCE INSIGHT", color = Amber, fontSize = 8.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = .8.sp)
-                    Text("Your consistency is producing results", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    Text("PERFORMANCE SUMMARY", color = Amber, fontSize = 8.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = .8.sp)
+                    Text("Based on recorded study and results", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
                 }
             }
             Text(detail, color = Color(0xFFD8DFEA), fontSize = 10.sp, lineHeight = 15.sp)
@@ -909,30 +1281,46 @@ private fun performanceInsight(courses: List<Course>, studyHours: Float, targetH
                 Text(if (expanded) "Hide evidence" else "View evidence", color = Amber, fontSize = 9.sp, fontWeight = FontWeight.Bold)
                 Icon(if (expanded) Icons.Default.ExpandLess else Icons.Default.ArrowForward, null, tint = Amber, modifier = Modifier.size(14.dp))
             }
-            if (expanded) Text("This insight compares the selected courses’ assessment averages with study-target completion. The current screen uses sample data until real study sessions and marks are connected.", color = Color(0xFFCBD3E1), fontSize = 9.sp, lineHeight = 14.sp)
+            if (expanded) Text("This summary uses only assessments and focus sessions saved on this device. It is calculated locally and is not generated by an AI service.", color = Color(0xFFCBD3E1), fontSize = 9.sp, lineHeight = 14.sp)
         }
     }
 }
 
-@Composable private fun PerformanceStudyTrendCard(mode: String, onModeChange: (String) -> Unit, courses: List<Course>, period: String) {
-    val performance = listOf(61f, 66f, 64f, 70f, 73f, 69f, 77f, 82f)
-    val study = listOf(3.5f, 4.2f, 4f, 5.6f, 6.2f, 5.8f, 7.1f, 8f)
-    val visiblePoints = if (period == "This week") 7 else if (period == "This month") 4 else 8
-    val visiblePerformance = performance.takeLast(visiblePoints)
-    val visibleStudy = study.takeLast(visiblePoints)
-    val avg = courses.mapNotNull { it.mark.removeSuffix("%").toFloatOrNull() }.average().takeIf { !it.isNaN() }?.toFloat() ?: 72f
-    val adjustment = avg - 72f
+@Composable private fun PerformanceStudyTrendCard(mode: String, onModeChange: (String) -> Unit, courses: List<Course>, period: String, sessions: List<StudySessionEntity>, assessments: List<AssessmentEntity>) {
+    val pointCount = when (period) { "This week" -> 7; "This month" -> 4; else -> 8 }
+    val now = System.currentTimeMillis()
+    val rangeStart = when (period) {
+        "This week" -> LocalDate.now().with(java.time.DayOfWeek.MONDAY).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        "This month" -> LocalDate.now().withDayOfMonth(1).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        else -> LocalDate.now().with(java.time.DayOfWeek.MONDAY).minusWeeks(7).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+    }
+    val rangeEnd = now.coerceAtLeast(rangeStart + 1)
+    val buckets = (0 until pointCount).map { index ->
+        val from = rangeStart + ((rangeEnd - rangeStart) * index / pointCount)
+        val until = rangeStart + ((rangeEnd - rangeStart) * (index + 1) / pointCount)
+        val bucketSessions = sessions.filter { it.startedAtMillis in from until until }
+        val bucketAssessments = assessments.filter { it.recordedAtMillis in from until until }
+        val grade = bucketAssessments.takeIf { it.isNotEmpty() }?.let { it.sumOf { row -> row.score.toDouble() } / it.sumOf { row -> row.maxScore.toDouble() } * 100.0 }?.toFloat()
+        val hours = bucketSessions.sumOf { it.accumulatedSeconds.toDouble() }.toFloat() / 3600f
+        grade to hours
+    }
+    val visiblePerformance = buckets.map { it.first ?: 0f }
+    val maxStudy = buckets.maxOfOrNull { it.second }?.takeIf { it > 0f } ?: 1f
+    val visibleStudy = buckets.map { it.second / maxStudy * 100f }
+    val hasPerformance = buckets.any { it.first != null }
+    val hasStudy = buckets.any { it.second > 0f }
     Surface(color = Color.White, shape = RoundedCornerShape(19.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFF0EAE0)), shadowElevation = 2.dp) {
         Column(Modifier.fillMaxWidth().padding(15.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Top) {
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
                     Text("Performance & study trend", color = Navy, fontSize = 15.sp, fontWeight = FontWeight.Bold)
                     Text("$period · ${if (courses.size == 1) courses.first().code else "All courses"}", color = Muted, fontSize = 8.sp)
                 }
-                Row(Modifier.clip(RoundedCornerShape(10.dp)).background(Color(0xFFF3F4F6)).padding(3.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color(0xFFF3F4F6)).padding(3.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                     listOf("Performance only" to "Grades", "Study only" to "Study", "Both" to "Both").forEach { (value, label) ->
-                        Surface(modifier = Modifier.clip(RoundedCornerShape(7.dp)).clickable { onModeChange(value) }, color = if (mode == value) Color.White else Color.Transparent, shape = RoundedCornerShape(7.dp), shadowElevation = if (mode == value) 1.dp else 0.dp) {
-                            Text(label, Modifier.padding(horizontal = 6.dp, vertical = 6.dp), color = Navy, fontSize = 7.sp, fontWeight = if (mode == value) FontWeight.Bold else FontWeight.Medium)
+                        val selected = mode == value
+                        Box(Modifier.weight(1f).height(34.dp).clip(RoundedCornerShape(7.dp)).background(if (selected) Color.White else Color.Transparent).clickable { onModeChange(value) }, contentAlignment = Alignment.Center) {
+                            Text(label, color = Navy, fontSize = 9.sp, maxLines = 1, softWrap = false, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium)
                         }
                     }
                 }
@@ -968,15 +1356,16 @@ private fun performanceInsight(courses: List<Course>, studyHours: Float, targetH
                                 drawCircle(color, radius = 3.dp.toPx(), center = androidx.compose.ui.geometry.Offset(x, y))
                             }
                         }
-                        if (mode != "Study only") plot(visiblePerformance.map { (it + adjustment).coerceIn(0f, 100f) }, Amber)
-                        if (mode != "Performance only") plot(visibleStudy.map { (it * 10f).coerceIn(0f, 100f) }, Navy)
+                        if (mode != "Study only" && hasPerformance) plot(visiblePerformance, Amber)
+                        if (mode != "Performance only" && hasStudy) plot(visibleStudy, Navy)
                     }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         visiblePerformance.indices.forEach { index -> Text(if (period == "This week") "D${index + 1}" else "W${index + 1}", color = Muted, fontSize = 7.sp) }
                     }
                 }
             }
-            Text("Study hours are normalized for comparison with average grades. Sample data is illustrative.", color = Muted, fontSize = 9.sp, lineHeight = 13.sp)
+            if (!hasPerformance && !hasStudy) EmptyState("No trend data in this period", "Complete a focus session or record an assessment to populate this chart.")
+            else Text("Study bars are normalized to the busiest interval. Grade points use assessments recorded in each interval.", color = Muted, fontSize = 9.sp, lineHeight = 13.sp)
         }
     }
 }
@@ -988,23 +1377,24 @@ private fun performanceInsight(courses: List<Course>, studyHours: Float, targetH
     }
 }
 
-@Composable private fun TimeAllocationCard(multiplier: Float) {
-    val entries = listOf(
-        Triple("Classes and assignments", 6f, Navy),
-        Triple("Independent study", 6.5f, Amber),
-        Triple("Extracurricular", 4f, Green),
-        Triple("Personal", 2f, Color(0xFF8A94A6))
-    )
-    val total = entries.sumOf { it.second.toDouble() }.toFloat() * multiplier
-    val academic = (entries[0].second + entries[1].second) * multiplier
-    val nonAcademic = (entries[2].second + entries[3].second) * multiplier
-    val ratio = academic / nonAcademic
+@Composable private fun TimeAllocationCard(sessions: List<StudySessionEntity>, analyticsTasks: List<StudyTask>) {
+    val total = sessions.sumOf { it.accumulatedSeconds.toDouble() }.toFloat() / 3600f
+    val grouped = sessions.groupBy { it.courseCode ?: "Independent study" }.map { (course, rows) ->
+        course to (rows.sumOf { it.accumulatedSeconds.toDouble() }.toFloat() / 3600f)
+    }.filter { it.second > 0f }.sortedByDescending { it.second }.take(4)
+    val palette = listOf(Navy, Amber, Green, Color(0xFF8A94A6))
+    val entries = grouped.mapIndexed { index, row -> Triple(row.first, row.second, palette[index % palette.size]) }
+    val academicPlanned = analyticsTasks.filter { it.type in listOf("Academic task", "Class or assignment", "Study session") }.sumOf { it.plannedHours.toDouble() }.toFloat()
+    val extracurricularPlanned = analyticsTasks.filter { it.type in listOf("Extracurricular task", "Personal activity") }.sumOf { it.plannedHours.toDouble() }.toFloat()
+    val academic = total + academicPlanned
+    val nonAcademic = extracurricularPlanned
+    val ratio = if (nonAcademic > 0f) academic / nonAcademic else Float.POSITIVE_INFINITY
     Surface(color = Color.White, shape = RoundedCornerShape(19.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFF0EAE0)), shadowElevation = 2.dp) {
         Column(Modifier.fillMaxWidth().padding(15.dp), verticalArrangement = Arrangement.spacedBy(11.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
                     Text("Time allocation", color = Navy, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                    Text("${total.prettyHours()} hours tracked · average weekly distribution", color = Muted, fontSize = 8.sp)
+                    Text("${total.prettyHours()} hours actually tracked", color = Muted, fontSize = 8.sp)
                 }
                 Icon(Icons.Default.MoreHoriz, "Time allocation options", tint = Muted)
             }
@@ -1013,7 +1403,7 @@ private fun performanceInsight(courses: List<Course>, studyHours: Float, targetH
                     androidx.compose.foundation.Canvas(Modifier.fillMaxSize().padding(5.dp)) {
                         val stroke = 22.dp.toPx()
                         var startAngle = -90f
-                        val baseTotal = entries.sumOf { it.second.toDouble() }.toFloat()
+                        val baseTotal = total
                         entries.forEach { (_, hours, color) ->
                             val sweep = hours / baseTotal * 360f
                             drawArc(color, startAngle, (sweep - 2f).coerceAtLeast(0f), false, style = androidx.compose.ui.graphics.drawscope.Stroke(width = stroke))
@@ -1026,18 +1416,21 @@ private fun performanceInsight(courses: List<Course>, studyHours: Float, targetH
                     }
                 }
             }
+            if (entries.isEmpty()) EmptyState("No tracked time yet", "Completed focus sessions will appear here. Planned activity durations are shown separately.")
             entries.forEach { (label, hours, color) ->
-                val percent = (hours / entries.sumOf { it.second.toDouble() }.toFloat() * 100).toInt()
+                val percent = if (total > 0f) (hours / total * 100).toInt() else 0
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
                     Box(Modifier.size(8.dp).background(color, CircleShape))
                     Text(label, Modifier.weight(1f), color = Navy, fontSize = 9.sp)
-                    Text("${(hours * multiplier).prettyHours()}h", color = Muted, fontSize = 8.sp)
+                    Text("${hours.prettyHours()}h", color = Muted, fontSize = 8.sp)
                     Text("$percent%", color = Navy, fontSize = 9.sp, fontWeight = FontWeight.Bold)
                 }
             }
-            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(if (ratio in 1.5f..3f) Color(0xFFEAF6F1) else Color(0xFFFFF0EB)).padding(10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                Icon(if (ratio in 1.5f..3f) Icons.Default.CheckCircle else Icons.Default.Warning, null, tint = if (ratio in 1.5f..3f) Green else Color(0xFFB84A2F), modifier = Modifier.size(15.dp))
-                Text(if (ratio in 1.5f..3f) "Healthy allocation · academic to personal ratio ${"%.1f".format(ratio)}:1" else "Review your academic and personal time balance · ${"%.1f".format(ratio)}:1", color = if (ratio in 1.5f..3f) Green else Color(0xFFB84A2F), fontSize = 8.sp, fontWeight = FontWeight.SemiBold, lineHeight = 12.sp)
+            Text("Planned commitments in this period: ${academicPlanned.prettyHours()} academic/study h · ${extracurricularPlanned.prettyHours()} extracurricular/personal h", color = Muted, fontSize = 8.sp, lineHeight = 12.sp)
+            val healthy = ratio in 1.5f..3f
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(if (healthy) Color(0xFFEAF6F1) else Color(0xFFFFF0EB)).padding(10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                Icon(if (healthy) Icons.Default.CheckCircle else Icons.Default.Warning, null, tint = if (healthy) Green else Color(0xFFB84A2F), modifier = Modifier.size(15.dp))
+                Text(if (nonAcademic <= 0f) "Add extracurricular or personal commitments to assess balance." else if (healthy) "Planned balance is within the 1.5–3:1 guide · ${"%.1f".format(ratio)}:1" else "Review the planned academic and personal balance · ${"%.1f".format(ratio)}:1", color = if (healthy) Green else Color(0xFFB84A2F), fontSize = 8.sp, fontWeight = FontWeight.SemiBold, lineHeight = 12.sp)
             }
         }
     }
@@ -1070,10 +1463,21 @@ private fun performanceInsight(courses: List<Course>, studyHours: Float, targetH
     }
 }
 
-@Composable private fun FocusPatternCard(period: String) {
+@Composable private fun FocusPatternCard(period: String, sessions: List<StudySessionEntity>) {
     val weekdays = listOf("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
     val times = listOf("Morning", "Midday", "Afternoon", "Evening")
-    fun intensity(time: Int, day: Int): Int = (time * 3 + day * 2 + time * day) % 5
+    val cells = Array(4) { FloatArray(7) }
+    sessions.forEach { session ->
+        val dateTime = Instant.ofEpochMilli(session.startedAtMillis).atZone(ZoneId.systemDefault())
+        val day = dateTime.dayOfWeek.value - 1
+        val hour = dateTime.hour
+        val bucket = when (hour) { in 5..10 -> 0; in 11..14 -> 1; in 15..18 -> 2; else -> 3 }
+        cells[bucket][day] += session.accumulatedSeconds / 3600f
+    }
+    val peakCell = (0..3).flatMap { t -> (0..6).map { d -> Triple(cells[t][d], t, d) } }.maxByOrNull { it.first }
+    val peakLabel = if (peakCell == null || peakCell.first <= 0f) "No peak yet" else "Peak ${times[peakCell.second]}"
+    val maxCell = cells.maxOfOrNull { row -> row.maxOrNull() ?: 0f }?.takeIf { it > 0f } ?: 1f
+    fun intensity(time: Int, day: Int): Int = (cells[time][day] / maxCell * 4f).toInt().coerceIn(0, 4)
     val levels = listOf(Color(0xFFF1F2F4), Color(0xFFFFE8B2), Color(0xFFFFCA5A), Amber, Navy)
     Surface(color = Color.White, shape = RoundedCornerShape(19.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFF0EAE0)), shadowElevation = 2.dp) {
         Column(Modifier.fillMaxWidth().padding(15.dp), verticalArrangement = Arrangement.spacedBy(11.dp)) {
@@ -1085,7 +1489,7 @@ private fun performanceInsight(courses: List<Course>, studyHours: Float, targetH
                 Surface(color = Color(0xFFFFF1D8), shape = CircleShape) {
                     Row(Modifier.padding(horizontal = 8.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         Icon(Icons.Default.AutoAwesome, null, tint = Color(0xFF9A6000), modifier = Modifier.size(11.dp))
-                        Text("Peak 9–12", color = Color(0xFF9A6000), fontSize = 7.sp, fontWeight = FontWeight.Bold)
+                        Text(peakLabel, color = Color(0xFF9A6000), fontSize = 7.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }
@@ -1102,7 +1506,7 @@ private fun performanceInsight(courses: List<Course>, studyHours: Float, targetH
                 }
             }
             HorizontalDivider(color = Line)
-            Text("Illustrative study intensity. Connect tracked focus sessions to show your personal history.", color = Muted, fontSize = 8.sp, lineHeight = 12.sp)
+            Text(if (sessions.isEmpty()) "No focus sessions were recorded in this period." else "Intensity reflects completed focus-session time by start day and time of day." , color = Muted, fontSize = 8.sp, lineHeight = 12.sp)
         }
     }
 }
@@ -1162,21 +1566,25 @@ private fun performanceInsight(courses: List<Course>, studyHours: Float, targetH
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun AddActivityDialog(courses: List<Course>, onDismiss: () -> Unit, onSave: (String, String, String, String, String, Boolean) -> Unit) {
-    var title by remember { mutableStateOf("") }
-    var course by remember { mutableStateOf("None") }
-    var due by remember { mutableStateOf("") }
-    var activityType by remember { mutableStateOf("Academic task") }
-    var priority by remember { mutableStateOf("AI recommendations") }
-    var smartReminder by remember { mutableStateOf(false) }
+@Composable private fun AddActivityDialog(courses: List<Course>, initial: ActivityEntity?, onDismiss: () -> Unit, onSave: (ActivityEntity) -> Unit) {
+    var title by remember(initial?.id) { mutableStateOf(initial?.title.orEmpty()) }
+    var course by remember(initial?.id) { mutableStateOf(initial?.courseCode?.let { code -> courses.firstOrNull { it.code == code }?.let { "${it.code} · ${it.name}" } } ?: initial?.courseLabel ?: "None") }
+    var dueAtMillis by remember(initial?.id) { mutableStateOf(initial?.dueAtMillis) }
+    var duePickerOpen by remember { mutableStateOf(false) }
+    var plannedHoursText by remember(initial?.id) { mutableStateOf(initial?.plannedHours?.toString() ?: "1") }
+    var activityType by remember(initial?.id) { mutableStateOf(initial?.category ?: "Academic task") }
+    var priority by remember(initial?.id) { mutableStateOf(initial?.priority ?: "Medium") }
+    var smartReminder by remember(initial?.id) { mutableStateOf(initial?.smartReminder ?: false) }
     var courseMenu by remember { mutableStateOf(false) }
     var typeMenu by remember { mutableStateOf(false) }
     var priorityMenu by remember { mutableStateOf(false) }
     val courseOptions = courses.map { "${it.code} · ${it.name}" } + listOf("Personal", "None")
     val typeOptions = listOf("Academic task", "Class or assignment", "Study session", "Personal activity", "Extracurricular task")
-    val priorityOptions = listOf("Low", "Medium", "High", "AI recommendations")
+    val priorityOptions = listOf("Low", "Medium", "High")
+    val dueLabel = dueAtMillis?.let { Instant.ofEpochMilli(it).atZone(ZoneId.systemDefault()).toLocalDate().format(DateTimeFormatter.ofPattern("EEE, d MMM yyyy")) } ?: "No due date"
+    val plannedHours = plannedHoursText.toFloatOrNull()?.takeIf { it in .25f..24f }
 
-    AlertDialog(onDismissRequest = onDismiss, title = { Text("Create new activity", color = Navy, fontWeight = FontWeight.Bold) }, text = {
+    AlertDialog(onDismissRequest = onDismiss, title = { Text(if (initial == null) "Create new activity" else "Edit activity", color = Navy, fontWeight = FontWeight.Bold) }, text = {
         Column(Modifier.heightIn(max = 540.dp).verticalScroll(androidx.compose.foundation.rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             OutlinedTextField(title, { title = it }, label = { Text("Task name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             ExposedDropdownMenuBox(expanded = courseMenu, onExpandedChange = { courseMenu = !courseMenu }) {
@@ -1185,7 +1593,8 @@ private fun performanceInsight(courses: List<Course>, studyHours: Float, targetH
                     courseOptions.forEach { option -> DropdownMenuItem(text = { Text(option) }, onClick = { course = option; courseMenu = false }) }
                 }
             }
-            OutlinedTextField(due, { due = it }, label = { Text("Due date and time") }, singleLine = true, placeholder = { Text("e.g. Friday, 2:00 PM") }, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(dueLabel, { }, readOnly = true, label = { Text("Due date") }, trailingIcon = { TextButton(onClick = { duePickerOpen = true }) { Text(if (dueAtMillis == null) "Choose" else "Change") } }, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(plannedHoursText, { plannedHoursText = it }, label = { Text("Planned duration") }, suffix = { Text("hours") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), modifier = Modifier.fillMaxWidth())
             ExposedDropdownMenuBox(expanded = typeMenu, onExpandedChange = { typeMenu = !typeMenu }) {
                 OutlinedTextField(activityType, {}, readOnly = true, label = { Text("Activity type") }, trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(typeMenu) }, modifier = Modifier.menuAnchor().fillMaxWidth())
                 ExposedDropdownMenu(expanded = typeMenu, onDismissRequest = { typeMenu = false }) {
@@ -1202,9 +1611,39 @@ private fun performanceInsight(courses: List<Course>, studyHours: Float, targetH
                 Checkbox(checked = smartReminder, onCheckedChange = { smartReminder = it }, colors = CheckboxDefaults.colors(checkedColor = Amber, checkmarkColor = Navy))
                 Column(Modifier.padding(start = 4.dp)) {
                     Text("Smart reminder", color = Navy, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                    Text("Suggest a reminder based on urgency and available time", color = Muted, fontSize = 10.sp, lineHeight = 14.sp)
+                    Text("Saved with this activity; Android notification delivery is not connected yet.", color = Muted, fontSize = 10.sp, lineHeight = 14.sp)
                 }
             }
         }
-    }, confirmButton = { TextButton(onClick = { if (title.isNotBlank()) onSave(title.trim(), course, due.trim(), activityType, priority, smartReminder) }, enabled = title.isNotBlank()) { Text("Save activity", color = Navy) } }, dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = Muted) } }, containerColor = Color.White)
+    }, confirmButton = { TextButton(onClick = {
+        val selectedCode = courses.firstOrNull { "${it.code} · ${it.name}" == course }?.code
+        val due = dueAtMillis?.let { Instant.ofEpochMilli(it).atZone(ZoneId.systemDefault()).toLocalDate().atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli() }
+        if (title.isNotBlank() && plannedHours != null) onSave(ActivityEntity(id = initial?.id ?: 0L, title = title.trim(), courseCode = selectedCode, courseLabel = course, dueLabel = dueLabel, dueAtMillis = due, category = activityType, priority = priority, smartReminder = smartReminder, plannedHours = plannedHours, completed = initial?.completed ?: false, createdAtMillis = initial?.createdAtMillis ?: System.currentTimeMillis()))
+    }, enabled = title.isNotBlank() && plannedHours != null) { Text("Save activity", color = Navy) } }, dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = Muted) } }, containerColor = Color.White)
+    if (duePickerOpen) {
+        val pickerInitial = dueAtMillis?.let { millis -> Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()).toLocalDate().atStartOfDay(ZoneId.of("UTC")).toInstant().toEpochMilli() }
+        val picker = rememberDatePickerState(initialSelectedDateMillis = pickerInitial)
+        DatePickerDialog(onDismissRequest = { duePickerOpen = false }, confirmButton = { TextButton(onClick = {
+            dueAtMillis = picker.selectedDateMillis?.let { millis -> Instant.ofEpochMilli(millis).atZone(ZoneId.of("UTC")).toLocalDate().atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli() }
+            duePickerOpen = false
+        }) { Text("Select") } }, dismissButton = { TextButton(onClick = { duePickerOpen = false }) { Text("Cancel") } }) { DatePicker(state = picker) }
+    }
+}
+
+@Composable private fun AddAssessmentDialog(course: Course, initial: AssessmentEntity?, onDismiss: () -> Unit, onSave: (String, Float, Float) -> Unit) {
+    var title by remember(initial?.id) { mutableStateOf(initial?.title.orEmpty()) }
+    var score by remember(initial?.id) { mutableStateOf(initial?.score?.toString().orEmpty()) }
+    var maximum by remember(initial?.id) { mutableStateOf(initial?.maxScore?.toString() ?: "100") }
+    val scoreValue = score.toFloatOrNull()
+    val maxValue = maximum.toFloatOrNull()
+    AlertDialog(onDismissRequest = onDismiss,
+        title = { Text(if (initial == null) "Add assessment" else "Edit assessment", color = Navy, fontWeight = FontWeight.Bold) },
+        text = { Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("${course.code} · ${course.name}", color = Muted, fontSize = 12.sp)
+            OutlinedTextField(title, { title = it }, label = { Text("Assessment name") }, singleLine = true)
+            OutlinedTextField(score, { score = it }, label = { Text("Score") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
+            OutlinedTextField(maximum, { maximum = it }, label = { Text("Maximum score") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
+        } },
+        confirmButton = { TextButton(onClick = { if (title.isNotBlank() && scoreValue != null && maxValue != null) onSave(title.trim(), scoreValue, maxValue) }, enabled = title.isNotBlank() && scoreValue != null && maxValue != null && maxValue > 0f && scoreValue in 0f..maxValue) { Text("Save result", color = Navy) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = Muted) } }, containerColor = Color.White)
 }
